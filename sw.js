@@ -1,4 +1,4 @@
-const CACHE = 'sunnysips-v4';
+const CACHE = 'sunnysips-v5';
 const STATIC = [
   '/', '/index.html', '/offline.html',
   '/styles.css', '/app.js', '/bars.csv',
