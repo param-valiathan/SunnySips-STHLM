@@ -44,16 +44,10 @@ SunnySips is a Progressive Web App that combines real-time sun position, 3D buil
 ## Running Locally
 
 ```bash
-cd /path/to/AntiGravity1
+cd /path/to/*localFolder
 python3 -m http.server 8743
 # open http://localhost:8743
 ```
-
----
-
-## Data
-
-`bars.csv` contains 387 Stockholm bars with coordinates, beer prices, opening hours, and happy hour info.
 
 ---
 
