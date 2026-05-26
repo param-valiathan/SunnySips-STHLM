@@ -418,7 +418,14 @@ function runShadowUpdate() {
 
   if (!buildingFeatures.length) {
     refreshBuildings();
-    if (!buildingFeatures.length) return;
+    if (!buildingFeatures.length) {
+      // Tiles not decoded yet — show price colors as fallback and retry shortly
+      barsData.forEach(b => { b._inShadow = false; });
+      updateMarkerColors();
+      renderBarsList();
+      setTimeout(scheduleShadowUpdate, 1500);
+      return;
+    }
   }
 
   showLoadingOverlay(true);
@@ -525,11 +532,21 @@ function getCardinalDirection(bearing) {
 // ============================================================
 // UI: TIME SLIDER
 // ============================================================
+function updateRealClock() {
+  const el = document.getElementById('real-day-time');
+  if (!el) return;
+  const now = new Date();
+  const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+  el.textContent = `${days[now.getDay()]} · ${pad(now.getHours())}:${pad(now.getMinutes())}`;
+}
+
 function initUI() {
   const slider = document.getElementById('time-slider');
   simHour = Math.min(22, Math.max(6, new Date().getHours()));
   slider.value = simHour;
   updateTimeDisplay();
+  updateRealClock();
+  setInterval(updateRealClock, 30000);
 
   slider.addEventListener('input', () => {
     simHour = +slider.value;
@@ -1006,7 +1023,8 @@ function isOpenNow(str) {
   if (parts.length < 2) return null;
 
   const toMin = t => { const [h, m] = t.trim().split(':').map(Number); return h * 60 + (m || 0); };
-  const nowM = simHour * 60;
+  const realNow = new Date();
+  const nowM = realNow.getHours() * 60 + realNow.getMinutes();
   let openM = toMin(parts[0]), closeM = toMin(parts[1]);
   if (closeM < openM) closeM += 1440;
   return nowM >= openM && nowM <= closeM;
