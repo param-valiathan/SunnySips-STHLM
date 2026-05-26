@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="theme-color" content="#F59E0B" />
+  <title>SunnySips STHLM — Offline</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body {
+      height: 100%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: #FFFBF0;
+      font-family: system-ui, sans-serif;
+      color: #1C1C1E;
+      text-align: center;
+      padding: 24px;
+    }
+    .card {
+      max-width: 320px;
+      background: rgba(255,255,255,0.8);
+      border: 1px solid rgba(245,158,11,0.25);
+      border-radius: 20px;
+      padding: 32px 28px;
+      box-shadow: 0 8px 32px rgba(0,0,0,0.08);
+    }
+    .icon { font-size: 3rem; margin-bottom: 16px; }
+    h1 { font-size: 1.2rem; font-weight: 800; letter-spacing: -0.02em; margin-bottom: 8px; }
+    h1 span { color: #F59E0B; }
+    p { font-size: 0.85rem; color: #78716C; line-height: 1.6; margin-bottom: 20px; }
+    button {
+      font-family: inherit;
+      font-size: 0.82rem;
+      font-weight: 700;
+      padding: 10px 22px;
+      border-radius: 100px;
+      border: 2px solid #F59E0B;
+      background: #F59E0B;
+      color: white;
+      cursor: pointer;
+    }
+    button:hover { background: #D97706; border-color: #D97706; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="icon">☁️</div>
+    <h1>Sunny<span>Sips</span> STHLM</h1>
+    <p>You're offline. Connect to the internet to see live sun shadows and weather.</p>
+    <button onclick="location.reload()">Try again</button>
+  </div>
+</body>
+</html>

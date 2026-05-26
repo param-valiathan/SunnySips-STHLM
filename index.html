@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <meta name="theme-color" content="#F59E0B" />
+  <meta name="description" content="Find Stockholm bars in direct sunlight — updated in real time." />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+  <meta name="apple-mobile-web-app-title" content="SunnySips" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' https://unpkg.com https://cdn.tailwindcss.com https://cloud.umami.is; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://unpkg.com; font-src https://fonts.gstatic.com; img-src * data: blob:; connect-src 'self' https://tiles.openfreemap.org https://api.open-meteo.com https://nominatim.openstreetmap.org https://cloud.umami.is https://api-gateway.umami.dev; worker-src 'self' blob:;" />
+  <title>SunnySips STHLM</title>
+  <link rel="manifest" href="manifest.json" />
+  <link rel="icon" href="icon.svg" type="image/svg+xml" />
+  <link rel="apple-touch-icon" href="icon.svg" />
+
+  <!-- Google Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;600;700;800&display=swap" rel="stylesheet" />
+
+  <!-- MapLibre GL JS -->
+  <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@4.5.0/dist/maplibre-gl.css" />
+  <script src="https://unpkg.com/maplibre-gl@4.5.0/dist/maplibre-gl.js"></script>
+
+  <!-- PapaParse -->
+  <script src="https://unpkg.com/papaparse@5.4.1/papaparse.min.js"></script>
+
+  <!-- SunCalc -->
+  <script src="https://unpkg.com/suncalc@1.9.0/suncalc.js"></script>
+
+  <!-- Turf.js for spatial ops (distance, point-in-polygon) -->
+  <script src="https://unpkg.com/@turf/turf@6.5.0/turf.min.js"></script>
+
+  <!-- Tailwind Play CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>tailwind.config = { corePlugins: { preflight: false }, important: false };</script>
+
+  <!-- Umami Analytics -->
+  <script defer src="https://cloud.umami.is/script.js" data-website-id="1f556189-f02f-4347-baa8-61f965b66e85"></script>
+
+  <link rel="stylesheet" href="styles.css?v=4" />
+</head>
+
+<body>
+
+  <!-- Map Canvas -->
+  <div id="map"></div>
+
+  <!-- Status Overlay -->
+  <div id="loading-overlay">Calculating shadows…</div>
+
+  <!-- Sun Compass Overlay -->
+  <div id="sun-compass" style="display: none;" aria-label="Sun compass" aria-hidden="true">
+    <div class="compass-dial">
+      <div class="sun-ray"></div>
+      <div class="sun-node">☀️</div>
+      <div class="compass-center"></div>
+    </div>
+    <div class="compass-label">
+      <div class="compass-dir" id="sun-dir-text">--</div>
+      <div class="compass-alt" id="sun-alt-text">--°</div>
+    </div>
+  </div>
+
+  <!-- Price Legend -->
+  <div id="price-legend" style="display:none;" aria-label="Beer price color scale">
+    <div class="legend-title">🍺 Beer price (in sun)</div>
+    <div class="legend-gradient"></div>
+    <div class="legend-labels">
+      <span id="legend-min">—</span>
+      <span id="legend-max">—</span>
+    </div>
+    <div class="legend-shadow-note"><span class="legend-swatch"></span>In shadow</div>
+  </div>
+
+  <!-- Main Panel -->
+  <aside id="panel" aria-label="SunnySips panel">
+    <!-- Mobile drag handle -->
+    <div id="panel-handle" role="button" aria-label="Expand panel" tabindex="0"></div>
+
+    <!-- Header -->
+    <header id="panel-header">
+      <div id="header-row">
+        <h1 id="app-title">Sunny<span>Sips</span> STHLM</h1>
+        <div id="weather-badge" aria-live="polite">
+          <span id="weather-icon">☀️</span>
+          <span id="weather-text">Loading…</span>
+        </div>
+      </div>
+    </header>
+
+    <!-- Tabs -->
+    <nav id="tabs" role="tablist">
+      <button class="tab-btn active" data-tab="search" role="tab" aria-selected="true" aria-controls="tab-search">Map &amp; Search</button>
+      <button class="tab-btn" data-tab="bars" role="tab" aria-selected="false" aria-controls="tab-bars">Bars Nearby</button>
+    </nav>
+
+    <!-- Tab: Map & Search -->
+    <div id="tab-search" class="tab-pane active" role="tabpanel">
+      <div id="search-wrapper">
+        <svg id="search-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+          stroke-width="2.5" stroke-linecap="round" aria-hidden="true">
+          <circle cx="11" cy="11" r="8" />
+          <line x1="21" y1="21" x2="16.65" y2="16.65" />
+        </svg>
+        <input type="text" id="search-input" placeholder="Search a place in Stockholm…" autocomplete="off"
+          aria-label="Search a place in Stockholm" aria-autocomplete="list" aria-controls="search-results" />
+        <ul id="search-results" role="listbox" aria-label="Search suggestions" style="display:none;"></ul>
+      </div>
+
+      <div id="search-tab-body">
+        <div id="sun-info-card">
+          <div class="sun-time" id="sun-time-big">12:00</div>
+          <div class="sun-label" id="sun-label-text">Sun simulation time</div>
+          <div id="weather-trend-row"><!-- Populated by JS --></div>
+        </div>
+
+        <div id="how-it-works">
+          <strong>How it works</strong>
+          Drag the slider to simulate the sun. Sunny markers are color-coded by beer price
+          (<span class="dot-cheap">●</span> cheap → <span class="dot-expensive">●</span> pricey),
+          <span class="dot-shadow">●</span> grey = in shadow. Tap a marker for details.
+        </div>
+      </div>
+    </div>
+
+    <!-- Tab: Bars Nearby -->
+    <div id="tab-bars" class="tab-pane" role="tabpanel">
+      <div id="bars-list-header">
+        <span id="bars-count">Loading…</span>
+      </div>
+      <div id="bars-list" role="list"></div>
+    </div>
+
+    <!-- Footer: Time Slider + Credit -->
+    <footer id="panel-footer">
+      <div id="time-footer-row">
+        <span id="time-display" aria-live="polite">12:00</span>
+        <button id="btn-now" aria-label="Reset to current time">Now</button>
+      </div>
+      <input type="range" id="time-slider" min="6" max="22" step="1" value="12"
+        aria-label="Simulate sun position by hour" />
+      <div id="slider-labels" aria-hidden="true">
+        <span>06:00</span>
+        <span>10:00</span>
+        <span>14:00</span>
+        <span>18:00</span>
+        <span>22:00</span>
+      </div>
+      <div id="creator-credit">Created by <strong>Param Valiathan</strong></div>
+    </footer>
+  </aside>
+
+  <script src="app.js?v=4"></script>
+</body>
+
+</html>
