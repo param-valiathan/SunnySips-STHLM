@@ -7,7 +7,7 @@ const CFG = {
   pitch: 50,
   maxBounds: [[17.70, 59.20], [18.25, 59.45]],
   mapStyle: 'https://tiles.openfreemap.org/styles/bright',
-  weatherUrl: 'https://api.open-meteo.com/v1/forecast?latitude=59.3293&longitude=18.0686&hourly=cloudcover,temperature_2m&current_weather=true&timezone=Europe%2FStockholm&forecast_days=1',
+  weatherUrl: 'https://api.open-meteo.com/v1/forecast?latitude=59.3293&longitude=18.0686&hourly=cloud_cover,temperature_2m&current_weather=true&timezone=Europe%2FStockholm&forecast_days=1',
   shadowStepM: 4,
   shadowMaxM: 200,
   overcastThreshold: 75,
@@ -77,6 +77,9 @@ document.addEventListener('DOMContentLoaded', () => {
   setInterval(fetchWeather, CFG.weatherRefreshMs);
   requestGeolocation();
   registerServiceWorker();
+  // Compass is shown immediately and refreshed every 5 s, independent of shadow calc
+  refreshCompass();
+  setInterval(refreshCompass, 5000);
 });
 
 function registerServiceWorker() {
@@ -138,6 +141,7 @@ function onMapLoad() {
   add3DBuildings();
   loadBars();
   if (window.innerWidth >= 640) map.setPadding({ left: 400, top: 20, right: 20, bottom: 20 });
+  refreshCompass();
 }
 
 // ============================================================
@@ -220,6 +224,8 @@ function refreshBuildings() {
           if (lat > maxLat) maxLat = lat;
         }
       }
+      // Skip implausibly large polygons (data artifacts from tile boundaries)
+      if ((maxLng - minLng) > 0.01 || (maxLat - minLat) > 0.01) continue;
       next.push({ rings, h, minLng, maxLng, minLat, maxLat });
     }
 
@@ -395,15 +401,22 @@ function scheduleShadowUpdate() {
 function runShadowUpdate() {
   if (!barsData.length) return;
 
-  const date = new Date();
-  date.setHours(simHour, 0, 0, 0);
+  const date = stockholmDate(simHour);
   const sun = SunCalc.getPosition(date, CFG.center[1], CFG.center[0]);
 
   updateMapLight(sun);
   updateSunCompass(sun);
 
-  if (isOvercast || sun.altitude <= 0) {
+  if (isOvercast) {
     barsData.forEach(b => { b._inShadow = true; });
+    updateMarkerColors();
+    renderBarsList();
+    return;
+  }
+
+  // Sun below horizon: show price colors rather than grey — the slider is a simulation tool
+  if (sun.altitude <= 0) {
+    barsData.forEach(b => { b._inShadow = false; });
     updateMarkerColors();
     renderBarsList();
     return;
@@ -460,10 +473,16 @@ function calcShadows(sun) {
     const rayMinLat = Math.min(lat, endLat) - 0.0001;
     const rayMaxLat = Math.max(lat, endLat) + 0.0001;
 
-    const filteredBldgs = buildingFeatures.filter(b =>
-      b.maxLng >= rayMinLng && b.minLng <= rayMaxLng &&
-      b.maxLat >= rayMinLat && b.minLat <= rayMaxLat
-    );
+    const filteredBldgs = buildingFeatures.filter(b => {
+      // Exclude the building the bar itself sits in — prevents self-shadowing
+      if (lon >= b.minLng && lon <= b.maxLng && lat >= b.minLat && lat <= b.maxLat) {
+        for (const ring of b.rings) {
+          if (pip(lon, lat, ring)) return false;
+        }
+      }
+      return b.maxLng >= rayMinLng && b.minLng <= rayMaxLng &&
+             b.maxLat >= rayMinLat && b.minLat <= rayMaxLat;
+    });
 
     bar._inShadow = castRay(lat, lon, dx, dy, steps, mPerLat, mPerLon, sun.altitude, filteredBldgs);
   });
@@ -532,6 +551,11 @@ function getCardinalDirection(bearing) {
 // ============================================================
 // UI: TIME SLIDER
 // ============================================================
+function refreshCompass() {
+  const sun = SunCalc.getPosition(stockholmDate(simHour), CFG.center[1], CFG.center[0]);
+  updateSunCompass(sun);
+}
+
 function updateRealClock() {
   const el = document.getElementById('real-day-time');
   if (!el) return;
@@ -551,6 +575,7 @@ function initUI() {
   slider.addEventListener('input', () => {
     simHour = +slider.value;
     updateTimeDisplay();
+    refreshCompass();
     scheduleShadowUpdate();
     track('time-change', { hour: simHour });
   });
@@ -559,6 +584,7 @@ function initUI() {
     simHour = Math.min(22, Math.max(6, new Date().getHours()));
     slider.value = simHour;
     updateTimeDisplay();
+    refreshCompass();
     scheduleShadowUpdate();
     track('time-reset-now', { hour: simHour });
   });
@@ -591,8 +617,7 @@ function updateTimeDisplay() {
   const pct = ((simHour - 6) / 16) * 100;
   document.getElementById('time-slider').style.setProperty('--pct', `${pct}%`);
 
-  const date = new Date();
-  date.setHours(simHour, 0, 0, 0);
+  const date = stockholmDate(simHour);
   const times = SunCalc.getTimes(date, CFG.center[1], CFG.center[0]);
   const sub = (times.sunrise && times.sunset)
     ? `Sunrise ${fmtTime(times.sunrise)} · Sunset ${fmtTime(times.sunset)}`
@@ -601,7 +626,10 @@ function updateTimeDisplay() {
 }
 
 function fmtTime(d) {
-  return `${String(d.getHours()).padStart(2,'0')}:${String(d.getMinutes()).padStart(2,'0')}`;
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'Europe/Stockholm', hour: '2-digit', minute: '2-digit', hour12: false,
+  }).formatToParts(d);
+  return `${parts.find(p => p.type === 'hour').value}:${parts.find(p => p.type === 'minute').value}`;
 }
 
 // ============================================================
@@ -884,11 +912,15 @@ async function fetchWeather() {
     clearTimeout(timeout);
 
     const hourlyTimes  = data.hourly?.time || [];
-    const hourlyClouds = data.hourly?.cloudcover || [];
+    const hourlyClouds = data.hourly?.cloud_cover ?? data.hourly?.cloudcover ?? [];
     const hourlyTemps  = data.hourly?.temperature_2m || [];
 
+    // API returns times in Stockholm timezone — match using Stockholm local hour
     const now = new Date();
-    const nowKey = `${now.getFullYear()}-${pad(now.getMonth()+1)}-${pad(now.getDate())}T${pad(now.getHours())}:00`;
+    const sthlmStr = now.toLocaleString('sv-SE', { timeZone: 'Europe/Stockholm' });
+    const [sthlmDate, sthlmTime] = sthlmStr.split(' ');
+    const sthlmHour = sthlmTime.split(':')[0];
+    const nowKey = `${sthlmDate}T${sthlmHour}:00`;
     const idx = hourlyTimes.indexOf(nowKey);
 
     const cloud   = idx >= 0 ? hourlyClouds[idx] : 50;
@@ -980,6 +1012,21 @@ function renderWeatherTrend(periods) {
 }
 
 function pad(n) { return String(n).padStart(2, '0'); }
+
+// Returns a Date whose UTC value equals simHour:00 in Stockholm local time,
+// regardless of what timezone the user's device is set to.
+function stockholmDate(simHour) {
+  const now = new Date();
+  // sv-SE locale reliably gives "YYYY-MM-DD HH:MM:SS" in 24h — stable across browsers/OS
+  const str = now.toLocaleString('sv-SE', { timeZone: 'Europe/Stockholm' });
+  const [datePart, timePart] = str.split(' ');
+  const [y, mo, d] = datePart.split('-').map(Number);
+  const [hh, mi, ss] = timePart.split(':').map(Number);
+  // Derive UTC offset by comparing parsed Stockholm ms against actual UTC ms
+  const sthlmMs = Date.UTC(y, mo - 1, d, hh, mi, ss);
+  const offsetH = Math.round((sthlmMs - now.getTime()) / 3600000);
+  return new Date(Date.UTC(y, mo - 1, d, simHour - offsetH, 0, 0));
+}
 
 // ============================================================
 // GEOLOCATION
