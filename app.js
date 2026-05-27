@@ -57,7 +57,7 @@ let map;
 let barsData = [];
 let userPos = null;
 let simHour = new Date().getHours();
-let isOvercast = false;
+let hourlyCloudCoverData = []; // Replaced isOvercast boolean with array data cache
 let shadowDebounceTimer = null;
 let activePopup = null;
 let shadowCache = {};
@@ -229,8 +229,7 @@ function refreshBuildings() {
       next.push({ rings, h, minLng, maxLng, minLat, maxLat });
     }
 
-    buildingFeatures = next;
-    shadowCache = {};
+    if (next.length) { buildingFeatures = next; shadowCache = {}; }
   } catch (_) {}
 }
 
@@ -407,7 +406,9 @@ function runShadowUpdate() {
   updateMapLight(sun);
   updateSunCompass(sun);
 
-  if (isOvercast) {
+  // Evaluate overcast state dynamically based on the current time slider value
+  const simulatedCloudCover = hourlyCloudCoverData.length ? (hourlyCloudCoverData[simHour] ?? 0) : 0;
+  if (simulatedCloudCover > CFG.overcastThreshold) {
     barsData.forEach(b => { b._inShadow = true; });
     updateMarkerColors();
     renderBarsList();
@@ -459,46 +460,76 @@ function runShadowUpdate() {
 function calcShadows(sun) {
   const dx = -Math.sin(sun.azimuth);
   const dy = -Math.cos(sun.azimuth);
-  const steps = Math.floor(CFG.shadowMaxM / CFG.shadowStepM);
+
+  // High-fidelity tracking resolution reduction
+  const stepSize = 1.5;
+  const steps = Math.floor(CFG.shadowMaxM / stepSize);
+
   const mPerLat = 111000;
   const mPerLon = 111000 * Math.cos(CFG.center[1] * Math.PI / 180);
+  const tanAlt = Math.tan(sun.altitude);
 
   barsData.forEach(bar => {
     const lat = bar.Latitude;
     const lon = bar.Longitude;
     const endLat = lat + (dy * CFG.shadowMaxM) / mPerLat;
     const endLon = lon + (dx * CFG.shadowMaxM) / mPerLon;
+
     const rayMinLng = Math.min(lon, endLon) - 0.0001;
     const rayMaxLng = Math.max(lon, endLon) + 0.0001;
     const rayMinLat = Math.min(lat, endLat) - 0.0001;
     const rayMaxLat = Math.max(lat, endLat) + 0.0001;
 
+    // Track if the bar sits inside a specific structural footprint to handle close self-intersection smoothly
+    let homeBldg = null;
     const filteredBldgs = buildingFeatures.filter(b => {
-      // Exclude the building the bar itself sits in — prevents self-shadowing
-      if (lon >= b.minLng && lon <= b.maxLng && lat >= b.minLat && lat <= b.maxLat) {
-        for (const ring of b.rings) {
-          if (pip(lon, lat, ring)) return false;
-        }
+      const boundsMatch = b.maxLng >= rayMinLng && b.minLng <= rayMaxLng &&
+                          b.maxLat >= rayMinLat && b.minLat <= rayMaxLat;
+
+      if (boundsMatch && !homeBldg && lon >= b.minLng && lon <= b.maxLng && lat >= b.minLat && lat <= b.maxLat) {
+        if (pip(lon, lat, b.rings[0])) { homeBldg = b; }
       }
-      return b.maxLng >= rayMinLng && b.minLng <= rayMaxLng &&
-             b.maxLat >= rayMinLat && b.minLat <= rayMaxLat;
+      return boundsMatch;
     });
 
-    bar._inShadow = castRay(lat, lon, dx, dy, steps, mPerLat, mPerLon, sun.altitude, filteredBldgs);
+    // Capture the maximum height within the filtered ray bounding box for predictive short-circuiting
+    const maxBldgHeight = filteredBldgs.reduce((max, b) => b.h > max ? b.h : max, 0);
+
+    bar._inShadow = castRayOptimized(
+      lat, lon, dx, dy, steps, stepSize, mPerLat, mPerLon,
+      tanAlt, filteredBldgs, homeBldg, maxBldgHeight
+    );
   });
 }
 
-function castRay(lat, lon, dx, dy, steps, mPerLat, mPerLon, sunAlt, filteredBldgs) {
+function castRayOptimized(lat, lon, dx, dy, steps, stepSize, mPerLat, mPerLon, tanAlt, filteredBldgs, homeBldg, maxBldgHeight) {
   if (!filteredBldgs.length) return false;
-  const tanAlt = Math.tan(sunAlt);
+
   for (let i = 1; i <= steps; i++) {
-    const d = i * CFG.shadowStepM;
+    const d = i * stepSize;
+
+    // Optimization A: Performance Short-Circuit
+    // Break tracking if the theoretical required structure height to block the sun exceeds the tallest local feature
+    if (d * tanAlt > (maxBldgHeight + 0.5)) {
+      break;
+    }
+
     const sLat = lat + (dy * d) / mPerLat;
     const sLon = lon + (dx * d) / mPerLon;
+
     for (const bldg of filteredBldgs) {
-      if (bldg.h > d * tanAlt) {
+      // Include an intentional 0.5m clearance padding to securely trap low angle edge buffers
+      if ((bldg.h + 0.5) > d * tanAlt) {
+
+        // Optimization B: Step-level Bounding Screen
+        // Explicitly isolate expensive Point-in-Polygon (pip) passes behind fast spatial grid matches
         if (sLon >= bldg.minLng && sLon <= bldg.maxLng &&
             sLat >= bldg.minLat && sLat <= bldg.maxLat) {
+
+          // Optimization C: Strategic Home-Building Intersection Pass-through
+          // Allow calculations near step zero to traverse home parameters smoothly if the ray has structurally cleared its height
+          if (bldg === homeBldg && bldg.h <= d * tanAlt) continue;
+
           for (const ring of bldg.rings) {
             if (pip(sLon, sLat, ring)) return true;
           }
@@ -528,7 +559,8 @@ function updateSunCompass(sun) {
   const el = document.getElementById('sun-compass');
   if (!el) return;
   const altDeg = sun.altitude * 180 / Math.PI;
-  if (altDeg <= 0 || isOvercast) { el.style.display = 'none'; return; }
+  const currentSimulatedCloud = hourlyCloudCoverData.length ? (hourlyCloudCoverData[simHour] ?? 0) : 0;
+  if (altDeg <= 0 || currentSimulatedCloud > CFG.overcastThreshold) { el.style.display = 'none'; return; }
   el.style.display = 'flex';
   const sunBearing = ((sun.azimuth + Math.PI) * 180 / Math.PI) % 360;
   const screenAngle = (sunBearing - (map ? map.getBearing() : 0) + 360) % 360;
@@ -928,16 +960,16 @@ async function fetchWeather() {
     const wmoCode = data.current_weather?.weathercode ?? (cloud > 75 ? 3 : cloud > 40 ? 2 : 0);
     const desc    = WMO[wmoCode] ?? `${cloud}% cloud`;
 
-    isOvercast = cloud > CFG.overcastThreshold;
+    hourlyCloudCoverData = hourlyClouds.length ? hourlyClouds : new Array(24).fill(50); // Guarantee array structural safety
     shadowCache = {};
 
     iconEl.textContent = weatherIcon(wmoCode, cloud);
     textEl.textContent = temp !== null ? `${Math.round(temp)}°C · ${desc}` : desc;
 
-    // Incremental class update — no attribute teardown
+    // Incremental class update - check evaluated target cloud thresholds dynamically
     badge.classList.remove('rain', 'overcast');
     if (wmoCode >= 61 && wmoCode <= 82) badge.classList.add('rain');
-    else if (isOvercast) badge.classList.add('overcast');
+    else if (cloud > CFG.overcastThreshold) badge.classList.add('overcast');
 
     const trendHours = [8, 11, 14, 17, 20];
     const trend = trendHours.map(h => {
