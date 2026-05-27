@@ -13,6 +13,7 @@ const CFG = {
   overcastThreshold: 75,
   stockholmFallback: [18.0686, 59.3293],
   weatherRefreshMs: 30 * 60 * 1000,
+  streetSideSearchM: 35,
 };
 
 // WMO weather code descriptions
@@ -641,6 +642,9 @@ function calcShadows(sun) {
   const mPerLon = 111000 * Math.cos(CFG.center[1] * Math.PI / 180);
   const tanAlt = Math.tan(sun.altitude);
 
+  // Pre-compute degree radius for street-side building search
+  const ssRadDeg = CFG.streetSideSearchM / 111000;
+
   barsData.forEach(bar => {
     const lat = bar.Latitude;
     const lon = bar.Longitude;
@@ -667,10 +671,22 @@ function calcShadows(sun) {
     // Capture the maximum height within the filtered ray bounding box for predictive short-circuiting
     const maxBldgHeight = filteredBldgs.reduce((max, b) => b.h > max ? b.h : max, 0);
 
-    bar._inShadow = castRayOptimized(
+    let inShadow = castRayOptimized(
       lat, lon, dx, dy, steps, stepSize, mPerLat, mPerLon,
       tanAlt, filteredBldgs, homeBldg, maxBldgHeight
     );
+
+    // Additive street-side factor: catches bars whose backing building is too close to appear
+    // in the forward ray path (bar coordinates sit on street, not inside the building)
+    if (!inShadow) {
+      const nearbyBldgs = buildingFeatures.filter(b =>
+        b.maxLng >= lon - ssRadDeg && b.minLng <= lon + ssRadDeg &&
+        b.maxLat >= lat - ssRadDeg && b.minLat <= lat + ssRadDeg
+      );
+      inShadow = calcStreetSideFactor(lat, lon, sun, nearbyBldgs);
+    }
+
+    bar._inShadow = inShadow;
   });
 }
 
@@ -709,6 +725,79 @@ function castRayOptimized(lat, lon, dx, dy, steps, stepSize, mPerLat, mPerLon, t
       }
     }
   }
+  return false;
+}
+
+// Street-side shadow factor: returns true when the nearest building edge is generally
+// in the sun's direction, meaning the bar faces away from the sun (shadow side of street).
+// Runs only as a fallback after ray-casting returns sunlit.
+function calcStreetSideFactor(barLat, barLng, sun, nearbyBldgs) {
+  if (!nearbyBldgs.length) return false;
+
+  const sunDx = -Math.sin(sun.azimuth);  // east-west unit component (positive = east)
+  const sunDy = -Math.cos(sun.azimuth);  // north-south unit component (positive = north)
+  const tanSunAlt = Math.tan(sun.altitude);
+
+  const mPerLon = 111000 * Math.cos(barLat * Math.PI / 180);
+  const mPerLat = 111000;
+  const searchR2 = CFG.streetSideSearchM * CFG.streetSideSearchM;
+
+  let minDist2 = Infinity;
+  let backDx = 0, backDy = 0;  // normalized metric unit vector: bar → nearest edge point
+  let nearestSunDirDist = Infinity, nearestSunDirH = 0;  // nearest edge in sun's forward half-plane
+
+  for (const bldg of nearbyBldgs) {
+    for (const ring of bldg.rings) {
+      const n = ring.length - 1;
+      for (let i = 0; i < n; i++) {
+        const [x1, y1] = ring[i];
+        const [x2, y2] = ring[i + 1];
+
+        const ex = (x2 - x1) * mPerLon;
+        const ey = (y2 - y1) * mPerLat;
+        const bx = (barLng - x1) * mPerLon;
+        const by = (barLat - y1) * mPerLat;
+
+        const eLen2 = ex * ex + ey * ey;
+        const t = eLen2 > 0 ? Math.max(0, Math.min(1, (bx * ex + by * ey) / eLen2)) : 0;
+
+        const cx = x1 + t * (x2 - x1);
+        const cy = y1 + t * (y2 - y1);
+
+        const dxM = (cx - barLng) * mPerLon;
+        const dyM = (cy - barLat) * mPerLat;
+        const d2 = dxM * dxM + dyM * dyM;
+
+        if (d2 < searchR2 && d2 > 0) {
+          const dist = Math.sqrt(d2);
+          const eDx = dxM / dist;
+          const eDy = dyM / dist;
+
+          if (d2 < minDist2) {
+            minDist2 = d2;
+            backDx = eDx;
+            backDy = eDy;
+          }
+
+          // Track nearest edge in sun's forward half-plane for elevation check
+          const dot = sunDx * eDx + sunDy * eDy;
+          if (dot > 0 && dist < nearestSunDirDist) {
+            nearestSunDirDist = dist;
+            nearestSunDirH = bldg.h;
+          }
+        }
+      }
+    }
+  }
+
+  if (minDist2 === Infinity) return false;
+
+  // Check 1 (original): nearest backing building is toward the sun (directional check)
+  if ((sunDx * backDx + sunDy * backDy) > 0.30) return true;
+
+  // Check 2 (new): nearest sun-side building is tall enough to geometrically block the sun
+  if (nearestSunDirDist < Infinity && nearestSunDirH / nearestSunDirDist > tanSunAlt) return true;
+
   return false;
 }
 
@@ -842,11 +931,22 @@ function fmtTime(d) {
 // ============================================================
 function initDragHandle(panel, handle) {
   let startY = 0, startH = 0, dragging = false;
+  const COLLAPSED_H = 130;
+  const EXPANDED_H  = () => Math.round(window.innerHeight * 0.82);
+  const SNAP_THRESHOLD = 60; // px of drag needed to commit to a direction
+
+  const snapTo = expanded => {
+    panel.style.transition = 'height 0.22s cubic-bezier(0.32, 0.72, 0, 1)';
+    panel.style.height = expanded ? `${EXPANDED_H()}px` : `${COLLAPSED_H}px`;
+    panel.classList.toggle('expanded', expanded);
+    panel.addEventListener('transitionend', () => { panel.style.transition = ''; }, { once: true });
+  };
 
   const onStart = e => {
     dragging = true;
     startY = e.touches ? e.touches[0].clientY : e.clientY;
     startH = panel.offsetHeight;
+    panel.style.transition = 'none';
     document.addEventListener('mousemove', onMove);
     document.addEventListener('touchmove', onMove, { passive: false });
     document.addEventListener('mouseup', onEnd);
@@ -857,17 +957,24 @@ function initDragHandle(panel, handle) {
     if (!dragging) return;
     if (e.cancelable) e.preventDefault();
     const y = e.touches ? e.touches[0].clientY : e.clientY;
-    const newH = Math.max(100, Math.min(window.innerHeight * 0.92, startH + (startY - y)));
+    const newH = Math.max(COLLAPSED_H, Math.min(window.innerHeight * 0.92, startH + (startY - y)));
     panel.style.height = `${newH}px`;
-    panel.classList.toggle('expanded', newH > 160);
   };
 
-  const onEnd = () => {
+  const onEnd = e => {
+    if (!dragging) return;
     dragging = false;
     document.removeEventListener('mousemove', onMove);
     document.removeEventListener('touchmove', onMove);
     document.removeEventListener('mouseup', onEnd);
     document.removeEventListener('touchend', onEnd);
+    const endY = e.changedTouches ? e.changedTouches[0].clientY : (e.clientY || startY);
+    const delta = startY - endY; // positive = dragged up
+    const currentH = panel.offsetHeight;
+    const wasExpanded = startH > COLLAPSED_H + 30;
+    // Snap up if dragged up enough, or already tall; snap down otherwise
+    const goExpanded = wasExpanded ? delta > -SNAP_THRESHOLD : delta > SNAP_THRESHOLD;
+    snapTo(goExpanded);
   };
 
   handle.addEventListener('mousedown', onStart);
@@ -912,7 +1019,7 @@ function renderBarsList() {
       : `${(bar._dist / 1000).toFixed(1)}km`;
 
     const card = document.createElement('div');
-    card.className = 'bar-card';
+    card.className = bar._inShadow === false ? 'bar-card sunny-card' : 'bar-card';
     card.dataset.lng = bar.Longitude;
     card.dataset.lat = bar.Latitude;
 
