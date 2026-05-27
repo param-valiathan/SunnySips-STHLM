@@ -61,6 +61,7 @@ let hourlyCloudCoverData = []; // Replaced isOvercast boolean with array data ca
 let shadowDebounceTimer = null;
 let activePopup = null;
 let shadowCache = {};
+let visualShadowCache = {};
 let currentSun = null;
 let priceRange = { min: 55, max: 130 };
 
@@ -139,6 +140,7 @@ function initMap() {
 
 function onMapLoad() {
   add3DBuildings();
+  addShadowLayer();
   loadBars();
   if (window.innerWidth >= 640) map.setPadding({ left: 400, top: 20, right: 20, bottom: 20 });
   refreshCompass();
@@ -189,6 +191,174 @@ function add3DBuildings() {
 }
 
 // ============================================================
+// CLOUD OVERLAY
+// ============================================================
+function initCloudOverlay() {
+  const style = document.createElement('style');
+  style.id = 'cloud-overlay-styles';
+  style.textContent = `
+    #cloud-overlay {
+      position: absolute;
+      inset: 0;
+      pointer-events: none;
+      z-index: 5;
+      overflow: hidden;
+      opacity: 0;
+      transition: opacity 2s ease;
+      mix-blend-mode: screen;
+    }
+    .cloud-puff {
+      position: absolute;
+      border-radius: 50%;
+      background: radial-gradient(ellipse at center,
+        rgba(255,255,255,0.82) 0%,
+        rgba(220,232,255,0.38) 48%,
+        rgba(200,218,255,0) 75%);
+      filter: blur(30px);
+      will-change: transform;
+      animation: cloudDrift var(--dur) ease-in-out infinite alternate;
+    }
+    @keyframes cloudDrift {
+      from { transform: translate(0, 0) scale(1); }
+      to   { transform: translate(var(--tx), var(--ty)) scale(var(--sc, 1.05)); }
+    }
+  `;
+  document.head.appendChild(style);
+
+  const overlay = document.createElement('div');
+  overlay.id = 'cloud-overlay';
+
+  const PUFFS = [
+    { w: 380, h: 200, t: '5%',  l: '10%', dur: '22s', tx: '18px',  ty: '10px',  sc: '1.04' },
+    { w: 300, h: 160, t: '12%', l: '50%', dur: '30s', tx: '-12px', ty: '15px',  sc: '1.06' },
+    { w: 450, h: 220, t: '2%',  l: '68%', dur: '38s', tx: '8px',   ty: '-8px',  sc: '1.03' },
+    { w: 260, h: 140, t: '30%', l: '25%', dur: '26s', tx: '-15px', ty: '12px',  sc: '1.05' },
+    { w: 320, h: 180, t: '18%', l: '-4%', dur: '45s', tx: '20px',  ty: '6px',   sc: '1.02' },
+    { w: 200, h: 120, t: '38%', l: '72%', dur: '20s', tx: '-10px', ty: '-12px', sc: '1.07' },
+    { w: 280, h: 150, t: '8%',  l: '33%', dur: '33s', tx: '14px',  ty: '8px',   sc: '1.04' },
+  ];
+
+  PUFFS.forEach(p => {
+    const puff = document.createElement('div');
+    puff.className = 'cloud-puff';
+    puff.style.cssText = `width:${p.w}px;height:${p.h}px;top:${p.t};left:${p.l};--dur:${p.dur};--tx:${p.tx};--ty:${p.ty};--sc:${p.sc}`;
+    overlay.appendChild(puff);
+  });
+
+  const mapEl = document.getElementById('map');
+  if (mapEl) mapEl.appendChild(overlay);
+}
+
+function updateCloudOverlay(cloudPct) {
+  const overlay = document.getElementById('cloud-overlay');
+  if (!overlay) return;
+  let opacity = 0;
+  if (cloudPct >= 70) {
+    opacity = 0.40 + ((cloudPct - 70) / 30) * 0.45; // 0.40 → 0.85
+  } else if (cloudPct >= 30) {
+    opacity = ((cloudPct - 30) / 40) * 0.50;         // 0 → 0.50
+  }
+  overlay.style.opacity = String(Math.min(0.85, opacity));
+}
+
+// ============================================================
+// VISUAL GROUND SHADOW LAYER
+// ============================================================
+function addShadowLayer() {
+  if (map.getSource('building-shadows')) return;
+  map.addSource('building-shadows', {
+    type: 'geojson',
+    data: { type: 'FeatureCollection', features: [] },
+  });
+  map.addLayer({
+    id: 'building-shadows',
+    type: 'fill',
+    source: 'building-shadows',
+    paint: {
+      'fill-color': '#1e293b',
+      'fill-opacity': 0,
+    },
+  }, '3d-buildings');
+}
+
+function buildShadowGeoJSON(sun) {
+  const dx = Math.sin(sun.azimuth);
+  const dy = Math.cos(sun.azimuth);
+  const mPerLat = 111000;
+  const mPerLon = 111000 * Math.cos(CFG.center[1] * Math.PI / 180);
+  const tanAlt = Math.tan(Math.max(0.05, sun.altitude));
+  const isMobile = window.innerWidth < 640;
+  const maxShadowM = isMobile ? 80 : CFG.shadowMaxM;
+  const limit = isMobile ? Math.min(buildingFeatures.length, 200) : buildingFeatures.length;
+
+  const features = [];
+  for (let bi = 0; bi < limit; bi++) {
+    const bldg = buildingFeatures[bi];
+    const shadowM = Math.min(bldg.h / tanAlt, maxShadowM);
+    const dLat = (dy * shadowM) / mPerLat;
+    const dLon = (dx * shadowM) / mPerLon;
+
+    for (const ring of bldg.rings) {
+      if (ring.length < 4) continue;
+      try {
+        // Projected footprint (shadow tip)
+        const projRing = ring.map(([lng, lat]) => [lng + dLon, lat + dLat]);
+        features.push({ type: 'Feature', geometry: { type: 'Polygon', coordinates: [projRing] } });
+        // Connecting quads from each edge of the footprint to its projected counterpart
+        for (let i = 0; i < ring.length - 1; i++) {
+          features.push({
+            type: 'Feature',
+            geometry: {
+              type: 'Polygon',
+              coordinates: [[
+                ring[i],
+                ring[i + 1],
+                [ring[i + 1][0] + dLon, ring[i + 1][1] + dLat],
+                [ring[i][0] + dLon, ring[i][1] + dLat],
+                ring[i],
+              ]],
+            },
+          });
+        }
+      } catch (_) {}
+    }
+  }
+  return { type: 'FeatureCollection', features };
+}
+
+function updateVisualShadows(sun) {
+  if (!map.getSource('building-shadows')) return;
+  const altDeg = sun.altitude * 180 / Math.PI;
+  const cloud = hourlyCloudCoverData.length ? (hourlyCloudCoverData[simHour] ?? 0) : 0;
+
+  if (altDeg <= 0 || !buildingFeatures.length) {
+    map.setPaintProperty('building-shadows', 'fill-opacity', 0);
+    return;
+  }
+
+  // 3-tier shadow opacity scaled to cloud cover
+  let shadowOpacity;
+  if (cloud >= 70) {
+    map.setPaintProperty('building-shadows', 'fill-opacity', 0);
+    return;
+  } else if (cloud >= 20) {
+    shadowOpacity = 0.25;                                    // partly cloudy — soft diffused
+  } else {
+    shadowOpacity = Math.max(0.45, 0.6 - altDeg * 0.002);  // clear sky — crisp, altitude-adjusted
+  }
+  map.setPaintProperty('building-shadows', 'fill-opacity', shadowOpacity);
+
+  if (visualShadowCache[simHour]) {
+    map.getSource('building-shadows').setData(visualShadowCache[simHour]);
+    return;
+  }
+
+  const geoJSON = buildShadowGeoJSON(sun);
+  visualShadowCache[simHour] = geoJSON;
+  map.getSource('building-shadows').setData(geoJSON);
+}
+
+// ============================================================
 // BUILDING INDEX
 // ============================================================
 function refreshBuildings() {
@@ -229,7 +399,7 @@ function refreshBuildings() {
       next.push({ rings, h, minLng, maxLng, minLat, maxLat });
     }
 
-    if (next.length) { buildingFeatures = next; shadowCache = {}; }
+    if (next.length) { buildingFeatures = next; shadowCache = {}; visualShadowCache = {}; }
   } catch (_) {}
 }
 
@@ -405,9 +575,11 @@ function runShadowUpdate() {
 
   updateMapLight(sun);
   updateSunCompass(sun);
+  updateVisualShadows(sun);
 
   // Evaluate overcast state dynamically based on the current time slider value
   const simulatedCloudCover = hourlyCloudCoverData.length ? (hourlyCloudCoverData[simHour] ?? 0) : 0;
+  updateCloudOverlay(simulatedCloudCover);
   if (simulatedCloudCover > CFG.overcastThreshold) {
     barsData.forEach(b => { b._inShadow = true; });
     updateMarkerColors();
@@ -597,6 +769,7 @@ function updateRealClock() {
 }
 
 function initUI() {
+  initCloudOverlay();
   const slider = document.getElementById('time-slider');
   simHour = Math.min(22, Math.max(6, new Date().getHours()));
   slider.value = simHour;
@@ -962,6 +1135,7 @@ async function fetchWeather() {
 
     hourlyCloudCoverData = hourlyClouds.length ? hourlyClouds : new Array(24).fill(50); // Guarantee array structural safety
     shadowCache = {};
+    visualShadowCache = {};
 
     iconEl.textContent = weatherIcon(wmoCode, cloud);
     textEl.textContent = temp !== null ? `${Math.round(temp)}°C · ${desc}` : desc;
